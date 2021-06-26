@@ -101,7 +101,8 @@ __global__ void gpu_conv(float const * const im, float const * const filter, flo
   float acc = 0;
 
   const int batch_index = blockIdx.y;
-  const int o_c = blockIdx.z;
+  const int i_c = blockIdx.z;
+
   const int o_x = tile_x + (threadIdx.x % TILE_X_SIZE);
   const int o_y = tile_y + (threadIdx.x / TILE_X_SIZE);
 
@@ -125,13 +126,29 @@ __global__ void gpu_conv(float const * const im, float const * const filter, flo
   //}
 
 
-  for (int i_c = 0; i_c < IN_CHANNELS; ++i_c) {
+  // CURRENT PROBLEM: for each output channel, we load this all into memory AGAIN.
+  // A location of the input is loaded into memory (num output channels) times.
+  // AND after each time we have to call __syncthreads(). Not ideal. Let's try 
+  // just updating all output channels for each filter 
+        
 
-    // CURRENT PROBLEM: for each output channel, we load this all into memory AGAIN.
-    // A location of the input is loaded into memory (num output channels) times.
-    // AND after each time we have to call __syncthreads(). Not ideal. Let's try 
-    // just updating all output channels for each filter 
-          
+  // load the single-channel tile of the input into shared memory
+  for (int index = threadIdx.x; index < ROUNDED_WINDOW_X_SIZE * valid_window_y_size; index += blockDim.x) {
+
+    int w_x = index % ROUNDED_WINDOW_X_SIZE;
+    int w_y = (index / ROUNDED_WINDOW_X_SIZE); 
+    int i_x = tile_x + w_x;
+    int i_y = tile_y + w_y;
+
+    if (i_x < IN_X_SIZE && i_y < IN_Y_SIZE && w_x < valid_window_x_size && w_y < valid_window_y_size) {
+      window[w_y * WINDOW_X_SIZE + w_x] = im[i_ind(batch_index, i_c, i_y, i_x)];
+    }
+  }
+
+  
+  for(int o_c = 0; o_c < OUT_CHANNELS; ++o_c) {
+    if (o_c > 0) __syncthreads(); // can't start loading filter for next channel until previous one is done
+
     // load filter into shared memory, for a single input channel
     for (int index = threadIdx.x; index < FILTER_X_SIZE * FILTER_Y_SIZE; index += blockDim.x) {
       fs[index] = filter[o_c * IN_CHANNELS * FILTER_X_SIZE * FILTER_Y_SIZE +  i_c * FILTER_X_SIZE * FILTER_Y_SIZE + index];
@@ -141,28 +158,8 @@ __global__ void gpu_conv(float const * const im, float const * const filter, flo
       //}
     }
 
-    // load the single-channel tile of the input into shared memory
-    for (int index = threadIdx.x; index < ROUNDED_WINDOW_X_SIZE * valid_window_y_size; index += blockDim.x) {
-
-      int w_x = index % ROUNDED_WINDOW_X_SIZE;
-      int w_y = (index / ROUNDED_WINDOW_X_SIZE); 
-      int i_x = tile_x + w_x;
-      int i_y = tile_y + w_y;
-
-      if (i_x < IN_X_SIZE && i_y < IN_Y_SIZE && w_x < valid_window_x_size && w_y < valid_window_y_size) {
-        window[w_y * WINDOW_X_SIZE + w_x] = im[i_ind(batch_index, i_c, i_y, i_x)];
-      }
-    }
-
-    // TODO the largest "sampling data (not issued)" entry in the nsight-compute source profiler
-    // is this barrier (it shows up as a barrier on the previous instruction, the above for loop).
-    // Ways to reduce: process as many in_channels as possible. Can utilize much more of the
-    // shared memory.
     __syncthreads();
-    
-    // loop over filter to accumulate convolution at thread-specific output location
-    // TODO ordering of these loops?
-    
+
     for(int f_x = 0; f_x < FILTER_X_SIZE; ++f_x) {
       for(int f_y = 0; f_y < FILTER_Y_SIZE; ++f_y) {
         // compute indices into the shared window
@@ -180,12 +177,11 @@ __global__ void gpu_conv(float const * const im, float const * const filter, flo
         }
       }
     }
-    // need to sync before we overwrite filter and window again.
-    __syncthreads();
-  }
 
-  if (o_x - tile_x < tile_x_size && o_y - tile_y < tile_y_size) {
-    out[o_ind(batch_index,o_c,o_y,o_x)] = acc;
+    if (o_x - tile_x < tile_x_size && o_y - tile_y < tile_y_size) {
+      atomicAdd(&out[o_ind(batch_index, o_c, o_y, o_x)], acc);
+    }
+    acc = 0.0;
   }
 }
 
@@ -276,7 +272,7 @@ int main( int argc, char *argv[] )
 
   // setup grid and block sizes
   const dim3 threads(1024, 1, 1); // max possible for me. one thread per entry in 32x32 tile 
-  const dim3 blocks( TILES_ALONG_X * TILES_ALONG_Y, BATCH_SIZE, OUT_CHANNELS);
+  const dim3 blocks( TILES_ALONG_X * TILES_ALONG_Y, BATCH_SIZE, IN_CHANNELS);
 
   const int window_size = WINDOW_X_SIZE * WINDOW_Y_SIZE;
   const int sharedMemSize = sizeof(float) * (FILTER_X_SIZE * FILTER_Y_SIZE + window_size);
@@ -300,7 +296,7 @@ int main( int argc, char *argv[] )
 
   // initialize output to 0, since compute it by adding to it. 
   // TODO: is this better than just having each thread initialize its loc to 0?
-  checkCUDA( cudaMemset( d_out, 0, OUT_BYTES ) );
+  checkCUDA( cudaMemset( d_out, 0.0, OUT_BYTES ) );
 
   //gpu_conv<<< blocks, threads, sharedMemSize >>> (d_image, d_filter, d_out);
   gpu_conv<<< blocks, threads, sharedMemSize >>> (d_image, d_filter, d_out);

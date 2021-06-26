@@ -6,12 +6,18 @@ All parameters (i.e. image size, filter size, etc) are currently constants in ke
 when "compare_with_cudnn" is set in kernel.cu, the executable produced by "make" will
 run both my implementation, and the cudnn implementation, and print the time each takes.
 Currently my implementation is much slower than the cudnn implementation for 
-larger inputs (my implementation achieves around 280 Gflops depending on parameters).
+larger inputs (my implementation achieves around 580 Gflops depending on parameters).
 
 
 
 TODO:
+Now, have to do more nsight-compute profiling to figure out the bottleneck. In order to compete
+with cudnn I probably have to figure out how to utilize the tensor cores somehow (which would
+be much easier with a GEMM implementation, instead of my direct conv2d one). 
 
+
+
+COMPLETED TODOS:
 based on nsight-compute source profiling, the main bottleneck is the loading of the image tiles
 into shared memory, and the __syncthreads() afterward. In the current implementation,
 each tile of the input image is loaded into shared memory once for each output channel
