@@ -1,163 +1,192 @@
 #include <stdio.h>
+#include <iostream>
 #include "cublas_v2.h"
-#include "../debug.h"
+#include "debug.h"
+#include "cudnn_conv.h"
 
-typedef float floatType_t;
+const int WARP_SIZE{32};
 
+const bool COMPARE_WITH_CPU{false};
+const bool COMPARE_WITH_CUDNN{true};
 
+const int BATCH_SIZE{128};
+const int IN_X_SIZE{128};
+const int IN_Y_SIZE{128};
+const int IN_CHANNELS{128};
+const int IN_SIZE{IN_X_SIZE * IN_Y_SIZE * IN_CHANNELS * BATCH_SIZE};
+const int IN_BYTES{IN_SIZE * sizeof(float)};
+const int FILTER_X_SIZE{3};
+const int FILTER_Y_SIZE{3};
+const int OUT_CHANNELS{128};
+const int OUT_X_SIZE{IN_X_SIZE - FILTER_X_SIZE + 1};
+const int OUT_Y_SIZE{IN_Y_SIZE - FILTER_Y_SIZE + 1};
+const int OUT_SIZE{OUT_X_SIZE * OUT_Y_SIZE * OUT_CHANNELS * BATCH_SIZE};
+const int OUT_BYTES{OUT_SIZE * sizeof(float)};
 
-#define COMPARE_WITH_CPU true
+// 32 * 32 = 1024, the max threads per block.
+const int TILE_X_SIZE{32};
+const int TILE_Y_SIZE{32};
 
-#define IN_IND(b, x, y, c, spec) ( ( (b) * (spec.in_x_size) * (spec.in_y_size) * (spec.in_channels)) + ( (c) * (spec.in_x_size) * (spec.in_y_size) ) + ( (y) * (spec.in_x_size) ) + (x) )
-#define O_IND(b, x, y, c, spec) ( ( (b) * (spec.out_x_size) * (spec.out_y_size) * (spec.out_channels)) + ( (c) * (spec.out_x_size) * (spec.out_y_size) ) + ( (y) * (spec.out_x_size) ) + (x) )
-#define F_IND(i_c, x, y, c, spec) ( ( (i_c) * (spec.filter_x_size) * (spec.filter_y_size) * (spec.filter_channels) ) + ( (c) * (spec.filter_x_size) * (spec.filter_y_size) ) + ( (y) * (spec.filter_x_size) ) + (x) )
+const int WINDOW_X_SIZE = TILE_X_SIZE + FILTER_X_SIZE - 1;
+const int WINDOW_Y_SIZE = TILE_Y_SIZE + FILTER_Y_SIZE - 1;
+// WINDOW_X_SIZE rounded up to nearest multiple of WARP_SIZE
+// TODO should this be computed in kernel, so it can be smaller for possible edge-cases of small windows at
+// right and/or bottom of image?
+const int ROUNDED_WINDOW_X_SIZE = ((WINDOW_X_SIZE - 1) / WARP_SIZE + 1) * WARP_SIZE;
+const int ROUNDED_WINDOW_Y_SIZE = ((WINDOW_Y_SIZE - 1) / WARP_SIZE + 1) * WARP_SIZE;
 
-#define W_IND(c, x, y, spec) ((c * spec.in_channels + x) * TILE_Y_SIZE + y) 
+const int TILES_ALONG_X = (OUT_X_SIZE - 1) / TILE_X_SIZE + 1;
+const int TILES_ALONG_Y = (OUT_Y_SIZE - 1) / TILE_Y_SIZE + 1;
 
-#define BATCH_SIZE (64)
-//#define BATCH_SIZE (16)
-
-#define IN_X_SIZE (128)
-#define IN_Y_SIZE (128)
-#define IN_CHANNELS (32)
-#define IN_SIZE (IN_X_SIZE * IN_Y_SIZE * IN_CHANNELS * BATCH_SIZE)
-#define IN_BYTES (IN_SIZE * sizeof(float))
-
-#define FILTER_X_SIZE (9)// - 6)
-#define FILTER_Y_SIZE (9)// - 6)
-#define FILTER_CHANNELS (16)// - 12)
-#define FILTER_SIZE (FILTER_X_SIZE * FILTER_Y_SIZE * FILTER_CHANNELS * IN_CHANNELS)
-#define FILTER_BYTES (FILTER_SIZE * sizeof(float))
-
-#define OUT_X_SIZE (IN_X_SIZE - FILTER_X_SIZE + 1)
-#define OUT_Y_SIZE (IN_Y_SIZE - FILTER_Y_SIZE + 1)
-#define OUT_CHANNELS (FILTER_CHANNELS)
-#define OUT_SIZE (OUT_X_SIZE * OUT_Y_SIZE * OUT_CHANNELS * BATCH_SIZE)
-#define OUT_BYTES (OUT_SIZE * sizeof(float))
-
-// Thread dimensions
-#define THREADS_PER_BLOCK_X 32
-#define THREADS_PER_BLOCK_Y 32
-
-
-struct conv_spec {
-  int batch_size;
-  int out_x_size;
-  int out_y_size;
-  int filter_channels;
-  int filter_x_size;
-  int filter_y_size;
-  int in_channels;
+__host__ __device__ int i_ind(const int b, const int c, const int y, const int x) {
+  return b * IN_X_SIZE * IN_Y_SIZE * IN_CHANNELS + c * IN_X_SIZE * IN_Y_SIZE + y * IN_X_SIZE + x;
+}
+__host__ __device__ int o_ind(const int b, const int c, const int y, const int x) {
+  return b * OUT_X_SIZE * OUT_Y_SIZE * OUT_CHANNELS + c * OUT_X_SIZE * OUT_Y_SIZE + y * OUT_X_SIZE + x;
+}
+__host__ __device__ int f_ind(const int i_c, const int o_c, const int y, const int x) {
+  return o_c * FILTER_X_SIZE * FILTER_Y_SIZE * IN_CHANNELS + i_c * FILTER_X_SIZE * FILTER_Y_SIZE + y * FILTER_X_SIZE + x;
+}
+__host__ __device__ int w_ind(const int c, const int y, const int x) {
+  return c * TILE_X_SIZE * TILE_Y_SIZE + y * TILE_X_SIZE + x;
 }
 
 
-// Computes convolution and saves output. Uses sizes defined above. 
-// TODO: make sizes arguments
-void host_conv(float const * const im, float const * const filter, float * out, conv_spec spec,) {
-  for( int b = 0; b < spec.batch_size; b++) {
-    for( int o_x = 0; o_x < spec.out_x_size; o_x++) {
-      for( int o_y = 0; o_y < spec.out_y_size; o_y++) {
-        for( int f_chan = 0; f_chan < spec.filter_channels; f_chan++) {
+// Computes convolution and saves output. 
+void host_conv(float const * const im, float const * const filter, float * out) {
+  for( int b = 0; b < BATCH_SIZE; b++) {
+    for( int o_x = 0; o_x < OUT_X_SIZE; o_x++) {
+      for( int o_y = 0; o_y < OUT_Y_SIZE; o_y++) {
+        for( int o_c = 0; o_c < OUT_CHANNELS; o_c++) {
           float temp = 0.0;
-          for( int f_x = 0; f_x < spec.filter_x_size; f_x++) {
-            for( int f_y = 0; f_y < spec.filter_y_size; f_y++) {
-              for( int i_chan = 0; i_chan < spec.in_channels; i_chan++) {
-                temp += (filter[F_IND(i_chan, f_x,f_y,f_chan)] * 
-                  im[IN_IND(b, o_x + f_x, o_y + f_y, i_chan)]);
+          for( int f_x = 0; f_x < FILTER_X_SIZE; f_x++) {
+            for( int f_y = 0; f_y < FILTER_Y_SIZE; f_y++) {
+              for( int i_c = 0; i_c < IN_CHANNELS; i_c++) {
+                temp += (filter[f_ind(i_c, o_c, f_y, f_x)] * 
+                  im[i_ind(b, i_c, o_y + f_y, o_x + f_x)]);
               }
             }
           }
-          out[O_IND(b, o_x,o_y,f_chan)] = temp;
+          out[o_ind(b, o_c, o_y, o_x)] = temp;
         }
       }
     }
   }
 }
 
-__global__ void gpu_conv(float const * const im, float const * const filter, float * out, const conv_spec spec) {
+/**
+  Indexing assumptions:
+  filter is formatted (in_channels, out_channels, height, width)
+  image is formatted (in_channels, height, width)
+  note that this means for im[c][y][x] the lowest order index, the x index, comes last
+  same for filter: filter[ic][oc][y][x]: x is the lowest index
+*/
+__global__ void gpu_conv(float const * const im, float const * const filter, float * out) {
   // shared memory for filter and for the relevant window of the image
-  // shared memory need sto contain filter of size spec.filter_x_size x spec.filter_y_size,
+  // shared memory need sto contain filter of size FILTER_X_SIZE x FILTER_Y_SIZE,
   // and window of image that we are convolving, of size
-  // (spec.threads_per_block_x + filter_x_size - 1) x (spec.threads_per_block_y + filter_y_size - 1)
-  __shared__ float shared[];
-  float fs[]{&shared};
-  float window[]{&shared[spec.filter_x_size * spec.filter_y_size * spec.filter_channels]};
+  // (WINDOW_X_SIZE, WINDOW_Y_SIZE)
+  extern __shared__ float shared[];
+  float* fs{&shared[0]};
+  float* window{&shared[FILTER_X_SIZE * FILTER_Y_SIZE]};
 
-  // window_x_size is the size of the window loaded into shared memory
-  // tile_x_size is the size of the output tile we are computing
-  const int window_x_size = spec.tile_x_size + spec.filter_x_size - 1;
-  const int window_y_size = spec.tile_y_size + spec.filter_y_size - 1;
-  // maybe use these later
-  //  int f_i = index % spec.in_channels;
-  //  int f_x = (index / spec.in_channels) % spec.filter_x_size;
-  //  int f_y = (index / spec.in_channels) / spec.filter_x_size;
-  //  int f_c = (index / spec.in_channels) / spec.filter_x_size % spec.out_channels;
-          
-  // load filter into shared memory
-  // TODO should fix this AFTER we know what order the filter is being iterated over in the main kernel loop below
-  for (int index = threadIdx.x; index < spec.in_channels * spec.out_channels * spec.filter_x_size * spec.filter_y_size; index += blockDim.x) {
-    fs[index] = filter[index];
-  }
+  // the upper-left index of the tile we are processing
+  // note that these indices can be used to index both the upper-left of the output tile,
+  // and the upper-left of the input window 
 
+  const int tile_x = (blockIdx.x % TILES_ALONG_X) * TILE_X_SIZE;
+  const int tile_y = (blockIdx.x / TILES_ALONG_X) * TILE_Y_SIZE;
 
-  // load window tile into shared memory
-  for (int c = 0; c < spec.in_channels, ++c) {
-    for (int off_x = 0; off_x < window_x_size; off_x += THREADS_PER_BLOCK_X) {
-      for (int off_y = 0; off_y < window_y_size; off_y += THREADS_PER_BLOCK_Y) {
-        // load into shared memory if necessary 
-        int w_x = off_x + tix;
-        int w_y = off_y + tiy;
-        if (w_x < window_x_size && w_y < window_y_size) {
-          if (o_x + off_x < spec.in_x_size && o_y + off_y < spec.in_y_size) {
-            window[w_x][w_y] = im[IN_IND(b, o_x + off_x, o_y + off_y, i_chan)];
-          }
-        }
-      }
-  }
+  // keeps track of accumulated output for this thread
+  float acc = 0;
 
-  __syncthreads();
-
-  // each thread will process a single output entry at a time (meaning, one channel at
-  // one location of the output image)
-
-  // the upper-left index of the output tile we are processing
-  const int tile_x = ((blockIdx.x * spec.tile_x_size) % spec.out_x_size); 
-  const int tile_y = ((blockIdx.x * spec.tile_x_size) / spec.out_x_size) * spec.tile_y_size;
-  // TODO any reason not to just use blockIdx.y for batch index?
   const int batch_index = blockIdx.y;
+  const int o_c = blockIdx.z;
+  const int o_x = tile_x + (threadIdx.x % TILE_X_SIZE);
+  const int o_y = tile_y + (threadIdx.x / TILE_X_SIZE);
 
-  // "index" is the index into the output tile (for the current thread). 
-  for (index = threadIdx.x; index < spec.tile_x_size * spec.tile_y_size * spec.out_channels; index += blockDim.x) {
+  const int valid_window_x_size = min(WINDOW_X_SIZE, IN_X_SIZE - tile_x);
+  const int valid_window_y_size = min(WINDOW_Y_SIZE, IN_Y_SIZE - tile_y);
 
-    int o_c = index % spec.out_channels;
-    int o_x = tile_x + ((index / spec.out_channels) % spec.tile_x_size);
-    int o_y = tile_y + ((index / spec.out_channels) / spec.tile_x_size);
+  const int tile_x_size = valid_window_x_size - FILTER_X_SIZE + 1;
+  const int tile_y_size = valid_window_y_size - FILTER_Y_SIZE + 1;
+
+
+  // possible idea: have output tile be in shared memory also, to make
+  // accumulation over multiple timesteps and multiple locations easier
+
+
+  //if (blockIdx.x == 3 && threadIdx.x == 0) {
+  //        printf("TILES_ALONG_X,y: %d, %d\n", TILES_ALONG_X, TILES_ALONG_Y);
+  //        printf("valid window sizes: %d, %d\n", valid_window_x_size, valid_window_y_size);
+  //        printf("tile_x, tile_y: %d, %d\n", tile_x, tile_y);
+  //        printf("tile sizes: %d, %d\n", tile_x_size, tile_y_size);
+  //        printf("threadIdx.x: %d\n", threadIdx.x);
+  //}
+
+
+  for (int i_c = 0; i_c < IN_CHANNELS; ++i_c) {
+
+    // CURRENT PROBLEM: for each output channel, we load this all into memory AGAIN.
+    // A location of the input is loaded into memory (num output channels) times.
+    // AND after each time we have to call __syncthreads(). Not ideal. Let's try 
+    // just updating all output channels for each filter 
           
-    float acc = 0;
-    for(f_x = 0; f_x < spec.filter_x_size; ++f_x) {
-      for(f_y = 0; f_y < spec.filter_y_size; ++f_y) {
-        // compute indices into the shared window
-        int w_y = index % window_y_size + f_y;
-        int w_x = (index / window_y_size) % window_x_size + f_x;
-        for(f_i = 0; f_i < spec.in_channels; ++f_i) {
+    // load filter into shared memory, for a single input channel
+    for (int index = threadIdx.x; index < FILTER_X_SIZE * FILTER_Y_SIZE; index += blockDim.x) {
+      fs[index] = filter[o_c * IN_CHANNELS * FILTER_X_SIZE * FILTER_Y_SIZE +  i_c * FILTER_X_SIZE * FILTER_Y_SIZE + index];
+      //if (i_c == 1 and index == 0) {
+      //  printf("Setting fs[0]: %f\n", fs[index]);
+      //  printf("IN_CHANNELS : %d\n", IN_CHANNELS);
+      //}
+    }
 
-          // the filter access is the same for all threads in the block. So no need to worry about bank conflicts, etc.
-          // only possible downside is that we're not fully utilizing shared memory thoroughput (instead of accessing 32 words
-          // per warp per memory acccess, we only access 1). This seems unavoidable though.
-          acc += (fs[F_IND(f_i,o_c,f_x,f_y)] * 
+    // load the single-channel tile of the input into shared memory
+    for (int index = threadIdx.x; index < ROUNDED_WINDOW_X_SIZE * valid_window_y_size; index += blockDim.x) {
+
+      int w_x = index % ROUNDED_WINDOW_X_SIZE;
+      int w_y = (index / ROUNDED_WINDOW_X_SIZE); 
+      int i_x = tile_x + w_x;
+      int i_y = tile_y + w_y;
+
+      if (i_x < IN_X_SIZE && i_y < IN_Y_SIZE && w_x < valid_window_x_size && w_y < valid_window_y_size) {
+        window[w_y * WINDOW_X_SIZE + w_x] = im[i_ind(batch_index, i_c, i_y, i_x)];
+      }
+    }
+
+    // TODO the largest "sampling data (not issued)" entry in the nsight-compute source profiler
+    // is this barrier (it shows up as a barrier on the previous instruction, the above for loop).
+    // Ways to reduce: process as many in_channels as possible. Can utilize much more of the
+    // shared memory.
+    __syncthreads();
+    
+    // loop over filter to accumulate convolution at thread-specific output location
+    // TODO ordering of these loops?
+    
+    for(int f_x = 0; f_x < FILTER_X_SIZE; ++f_x) {
+      for(int f_y = 0; f_y < FILTER_Y_SIZE; ++f_y) {
+        // compute indices into the shared window
+        int w_x = threadIdx.x % TILE_X_SIZE  + f_x;
+        int w_y = threadIdx.x / TILE_X_SIZE + f_y;
+        //if (o_x == testx && o_y == testy) {
+        //        //printf("F: %d,%d: %f\n", f_y, f_x, fs[f_y * FILTER_Y_SIZE + f_x]);
+        //        printf("W: %d,%d: %f\n", w_x, w_y, window[w_y * WINDOW_X_SIZE + w_x]);
+        //}
+
+        if (w_y < valid_window_y_size && w_x < valid_window_x_size) {
+          acc += (fs[f_y * FILTER_X_SIZE + f_x] * 
               // for the window, since w_y is the lowest index, make sure that w_y varies along threadIdx.x
-              window[W_IND(f_i, w_x, w_y)];
+              window[w_y * WINDOW_X_SIZE + w_x]);
         }
       }
     }
-    out[O_IND(batch_index,o_x,o_y,o_c)] = acc;
-    o_count += 1;
-    o_c =  (blockIdx.x * blockDim.x + (threadIdx.x + blockDim.x * o_count)) % spec.out_channels;
-    o_x = ((blockIdx.x * blockDim.x + (threadIdx.x + blockDim.x * o_count)) / spec.out_channels ) % spec.out_x_size;
-    o_y = ((blockIdx.x * blockDim.x + (threadIdx.x + blockDim.x * o_count)) / spec.out_channels ) / spec.out_x_size;
-  } 
+    // need to sync before we overwrite filter and window again.
+    __syncthreads();
+  }
 
-
+  if (o_x - tile_x < tile_x_size && o_y - tile_y < tile_y_size) {
+    out[o_ind(batch_index,o_c,o_y,o_x)] = acc;
+  }
 }
 
 
@@ -166,15 +195,14 @@ int main( int argc, char *argv[] )
 {
 
   /* get GPU device number and name */
-
   int dev;
   cudaDeviceProp deviceProp;
   checkCUDA( cudaGetDevice( &dev ) );
   checkCUDA( cudaGetDeviceProperties( &deviceProp, dev ) );
   printf("Using GPU %d: %s\n", dev, deviceProp.name );
 
-  fprintf(stdout, "\nImage size is %d x %d x %d\n",IN_X_SIZE, IN_Y_SIZE, IN_CHANNELS);
-  fprintf(stdout, "Filter size is %d x %d x %d\n",FILTER_X_SIZE, FILTER_Y_SIZE, FILTER_CHANNELS);
+  fprintf(stdout, "\nImage size is %d x %d x %d\n",IN_CHANNELS, IN_X_SIZE, IN_Y_SIZE);
+  fprintf(stdout, "Filter size is %d x %d x %d x %d\n",IN_CHANNELS, OUT_CHANNELS, FILTER_X_SIZE, FILTER_Y_SIZE);
   fprintf(stdout, "Batch size is %d\n",BATCH_SIZE);
 
   // arrays for image and filter on host and device, and
@@ -188,7 +216,9 @@ int main( int argc, char *argv[] )
   if (status != cudaSuccess) {
     printf("Error allocating image memory.\n");
   }
-  status = cudaMallocHost((void**) &h_filter, FILTER_BYTES);
+  const int filter_size = FILTER_X_SIZE * FILTER_Y_SIZE * IN_CHANNELS * OUT_CHANNELS;
+  const int filter_bytes = sizeof(float) * filter_size;
+  status = cudaMallocHost((void**) &h_filter, filter_bytes);
   if (status != cudaSuccess) {
     printf("Error allocating filter memory.\n");
   }
@@ -213,15 +243,18 @@ int main( int argc, char *argv[] )
   memset( h_gpu_out, 0, OUT_BYTES);
 
   // randomly initialize the image and the filter
-  for( int i = 0; i < IN_SIZE; i++ ) {
+  // TODO redo random init
+  for( int i = 0; i < IN_SIZE; ++i ) {
     h_image[i] = float( rand() ) / ( float(RAND_MAX) + 1.0 );
+    //h_image[i] = 1.0 + ((i / (IN_X_SIZE * IN_Y_SIZE)) % 2);
+    //h_image[i] = 1.0;
   }
-  for(int i = 0; i < FILTER_SIZE; i++ ) {
+  for(int i = 0; i < filter_size; ++i ) {
     h_filter[i] = float( rand() ) / ( float(RAND_MAX) + 1.0 );
+    //h_filter[i] = 0.0 + ((i / (IN_X_SIZE * IN_Y_SIZE)) % 2);
+    //h_filter[i] = 1.0;
   }
 
-
-  // First, we want to run the convolution on the CPU. 
 
   // start timers
   cudaEvent_t start, stop;
@@ -229,32 +262,48 @@ int main( int argc, char *argv[] )
   checkCUDA( cudaEventCreate( &stop ) );
   checkCUDA( cudaEventRecord( start, 0 ) );
 
-
   /////////
   // GPU //
   /////////
 
   // allocate image, filter, and output in GPU memory
   checkCUDA( cudaMalloc( (void **)&d_image, IN_BYTES ) );
-  checkCUDA( cudaMalloc( (void **)&d_filter, FILTER_BYTES ) );
+  checkCUDA( cudaMalloc( (void **)&d_filter, filter_bytes ) );
   checkCUDA( cudaMalloc( (void **)&d_out, OUT_BYTES ) );
   // copy image and filter to device
   checkCUDA( cudaMemcpy( d_image, h_image, IN_BYTES, cudaMemcpyHostToDevice ) );
-  checkCUDA( cudaMemcpy( d_filter, h_filter, FILTER_BYTES, cudaMemcpyHostToDevice ) );
+  checkCUDA( cudaMemcpy( d_filter, h_filter, filter_bytes, cudaMemcpyHostToDevice ) );
+
+  // setup grid and block sizes
+  const dim3 threads(1024, 1, 1); // max possible for me. one thread per entry in 32x32 tile 
+  const dim3 blocks( TILES_ALONG_X * TILES_ALONG_Y, BATCH_SIZE, OUT_CHANNELS);
+
+  const int window_size = WINDOW_X_SIZE * WINDOW_Y_SIZE;
+  const int sharedMemSize = sizeof(float) * (FILTER_X_SIZE * FILTER_Y_SIZE + window_size);
+
+  // start timer
+  printf("ROUNDED_WINDOW_X_SIZE: %d\n", ROUNDED_WINDOW_X_SIZE);
+  printf("ROUNDED_WINDOW_Y_SIZE: %d\n", ROUNDED_WINDOW_Y_SIZE);
+  printf("WINDOW_X_SIZE: %d\n", WINDOW_X_SIZE);
+  printf("WINDOW_Y_SIZE: %d\n", WINDOW_Y_SIZE);
+
+  printf("blocks.z: %d\n", blocks.z);
+  printf("blocks.x: %d\n", blocks.x);
+  printf("blocks.y: %d\n", blocks.y);
+  printf("blocks.z: %d\n", blocks.z);
+  printf("threads: %d\n", threads.x);
+  printf("filter_size: %d\n", filter_size);
+  printf("window_size: %d\n", window_size);
+  printf("shmem size: %d\n", sharedMemSize);
+
+  checkCUDA( cudaEventRecord( start, 0 ) );
+
   // initialize output to 0, since compute it by adding to it. 
   // TODO: is this better than just having each thread initialize its loc to 0?
   checkCUDA( cudaMemset( d_out, 0, OUT_BYTES ) );
 
-  // setup grid and block sizes
-  dim3 threads( THREADS_PER_BLOCK_X, THREADS_PER_BLOCK_Y, 1 );
-  dim3 blocks( OUT_X_SIZE / THREADS_PER_BLOCK_X + 1, 
-               OUT_Y_SIZE / THREADS_PER_BLOCK_Y + 1, BATCH_SIZE * FILTER_CHANNELS * IN_CHANNELS);
-
-
-  // start timer
-  checkCUDA( cudaEventRecord( start, 0 ) );
-
-  gpu_conv<<< blocks, threads >>> (d_image, d_filter, d_out);
+  //gpu_conv<<< blocks, threads, sharedMemSize >>> (d_image, d_filter, d_out);
+  gpu_conv<<< blocks, threads, sharedMemSize >>> (d_image, d_filter, d_out);
   checkKERNEL();
 
   // stop timer and print time
@@ -302,12 +351,60 @@ int main( int argc, char *argv[] )
     else printf("PASS\n");
   }
 
+  if (COMPARE_WITH_CUDNN) {
+    float* cudnn_output; float* h_cudnn_out;
+    checkCUDA( cudaMalloc( (void **)&cudnn_output, OUT_BYTES ));
+
+    cudaMallocHost((void**) &h_cudnn_out, OUT_BYTES);
+    if (status != cudaSuccess) {
+      printf("Error allocating cudnn host memory.\n");
+    }
+
+    float cudnn_time;
+
+    cudnn_time = cudnnConv(d_image, d_filter, cudnn_output, IN_X_SIZE, IN_Y_SIZE, IN_CHANNELS, BATCH_SIZE, OUT_CHANNELS, FILTER_X_SIZE, FILTER_Y_SIZE, OUT_X_SIZE, OUT_Y_SIZE);
+
+
+    checkCUDA( cudaMemcpy( h_cudnn_out, cudnn_output, OUT_BYTES, cudaMemcpyDefault ) );
+
+
+    // compare CUDNN implementation results with CPU results
+    float temp = 0.0;
+    for( int i = 0; i < OUT_SIZE; i++ ) {
+      //printf("CPU : %f, GPU : %f\n", h_cpu_out[i], h_gpu_out[i]);
+      float orig_temp = temp;
+      temp += ( h_gpu_out[i] - h_cudnn_out[i] ) * ( h_gpu_out[i] - h_cudnn_out[i] );
+    } 
+
+    printf("CUDNN error from GPU is %f\n",temp);
+    if( temp > 10 ) printf("CUDNN FAIL\n");
+    else printf("CUDNN PASS\n");
+
+    printf("CUDNN TIME: %f", cudnn_time);
+    cudaFree(cudnn_output);
+    cudaFreeHost(h_cudnn_out);
+  }
+    
+    
+
+
+  //int testx = 10;
+  //int testy = 29;
+
+  //printf("test index: %d, %d\n", testx, testy);
+  //printf("cpu out: %f\n", h_cpu_out[testy * OUT_Y_SIZE + testx]);
+  //printf("gpu out: %f\n", h_gpu_out[testy * OUT_Y_SIZE + testx]);
+
 
   // cleanup
   cudaFreeHost( h_image );
   cudaFreeHost( h_filter );
   free( h_cpu_out );
   cudaFreeHost( h_gpu_out );
+
+  cudaFree(d_out);
+  cudaFree(d_image);
+  cudaFree(d_filter);
 
   cudaError_t cudaStatus = cudaDeviceReset();
   if (cudaStatus != cudaSuccess) {
