@@ -6,7 +6,7 @@ All parameters (i.e. image size, filter size, etc) are currently constants in ke
 when "compare_with_cudnn" is set in kernel.cu, the executable produced by "make" will
 run both my implementation, and the cudnn implementation, and print the time each takes.
 Currently my implementation is much slower than the cudnn implementation for 
-larger inputs. 
+larger inputs (my implementation achieves around 280 Gflops depending on parameters).
 
 
 
