@@ -11,7 +11,6 @@ this helped me get started with cudnn
 
 
 float cudnnConv(float* input, float* filter, float* output, int in_height, int in_width, int in_channels, int batch_size, int out_channels, int kernel_height, int kernel_width, int out_height, int out_width) {
-  printf("here 0\n");
   cudnnHandle_t cudnn;
   checkCUDNN(cudnnCreate(&cudnn));
 
@@ -106,6 +105,6 @@ float cudnnConv(float* input, float* filter, float* output, int in_height, int i
   checkCUDA( cudaEventRecord( stop, 0 ) );
   checkCUDA( cudaEventSynchronize( stop ) );
   checkCUDA( cudaEventElapsedTime( &elapsedTime, start, stop ) );
-  return elapsedTime / 1000.0f;
+  return elapsedTime;
 }
 
